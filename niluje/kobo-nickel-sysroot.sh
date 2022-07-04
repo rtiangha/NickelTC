@@ -111,7 +111,7 @@ echo "* Building zlib-ng . . ."
 echo ""
 ZLIB_SOVER="1.2.11.zlib-ng"
 rm -rf zlib-ng
-until git clone --depth 1 https://github.com/zlib-ng/zlib-ng.git ; do
+until git clone -b 1.9.9-b1 --depth 1 https://github.com/zlib-ng/zlib-ng.git ; do
 	rm -rf zlib-ng
 	sleep 15
 done
