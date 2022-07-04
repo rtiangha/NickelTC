@@ -171,7 +171,7 @@ export CXXFLAGS="${NOLTO_CFLAGS}"
 echo "* Building zlib-ng . . ."
 echo ""
 ZLIB_SOVER="1.2.11.zlib-ng"
-do_git "https://github.com/zlib-ng/zlib-ng.git" "develop" "zlib-ng"
+do_git "https://github.com/zlib-ng/zlib-ng.git" "2.0.6" "zlib-ng"
 update_title_info
 # NOTE: We CANNOT support runtime HWCAP checks, because we mostly don't have access to getauxval (c.f., comments around OpenSSL for more details).
 #       On the other hand, we don't need 'em: we know the exact target we're running on.
