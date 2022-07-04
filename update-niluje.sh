@@ -6,12 +6,13 @@ rm -rf niluje
 mkdir niluje
 cd niluje
 
-rev=17194
+rev=18954
 files=(
     CMakeCross.txt
     kobo-nickel-sysroot.sh
     x-compile.sh
     zlib-ng-nerf-arm-hwcap.patch
+    zlib-ng-fix-arm-float-detection.diff
     libpng-fix-Makefile-for-lto.patch
     qtbase-5.2-configure-fix.patch
     qtbase-5.2-configure-fix-2.patch

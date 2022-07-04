@@ -19,18 +19,75 @@
 SCRIPT_NAME="${BASH_SOURCE[0]-${(%):-%x}}"
 SCRIPT_BASE_DIR="$(readlink -f "${SCRIPT_NAME%/*}")"
 
-# Are we in a live checkout of my SVN tree?
-if ! svn info "${SCRIPT_BASE_DIR}" &>/dev/null ; then
-	# Build a list of what we need, and get it.
-	for svn_dep in $(grep '${SCRIPT_BASE_DIR}/' "${SCRIPT_NAME}" | cut -f2 -d'/' | cut -f1 -d' ') ; do
-		if [[ ${#svn_dep} -le 2 ]] ; then
-			continue
-		fi
+# wget wrapper
+do_wget()
+{
+	URL="${1}"
+	OUT="${2}"
+
+	if (( $# != 2 )) ; then
+		echo "Invalid args passed to do_wget (URL, OUT)"
+		return 1
+	fi
+
+	wget "${URL}" -O "${OUT}"
+}
+
+# git clone wrapper
+do_git()
+{
+	REPO="${1}"
+	BRANCH="${2}"
+	OUT="${3}"
+
+	if (( $# != 3 )) ; then
+		echo "Invalid args passed to do_git (REPO, BRANCH, OUT)"
+		return 1
+	fi
+
+	rm -rf "${OUT}"
+	until git clone -b "${BRANCH}" --single-branch --depth 1 "${REPO}" "${OUT}" ; do
+		rm -rf "${OUT}"
+		sleep 15
+	done
+	cd "${OUT}"
+}
+
+# git fetch/kobo switcheroo wrapper
+do_git_fetch_kobo()
+{
+	module="${1}"
+
+	# Nothing can be moved, that's the internal Qt directory structure
+	if (( $# != 1 )) ; then
+		echo "Invalid args passed to do_git_fetch_kobo (module)"
+		return 1
+	fi
+
+	git remote add kobo https://github.com/kobolabs/${module}.git
+	until git fetch kobo ; do
+		sleep 15
+	done
+	git checkout kobo
+}
+
+# Allow overriding the wrappers
+if [[ -x "${SCRIPT_BASE_DIR}/x-funcs-override.sh" ]] ; then
+	source "${SCRIPT_BASE_DIR}/x-funcs-override.sh"
+fi
+
+# Build a list of what we need from my SVN tree, and get it if need be.
+for svn_dep in $(grep ' ${SCRIPT_BASE_DIR}/' "${SCRIPT_NAME}" | cut -f2 -d'/' | cut -f1 -d' ') ; do
+	if [[ ${#svn_dep} -le 2 ]] ; then
+		continue
+	fi
+	# Don't checkout existing stuff
+	if [[ ! -e "${SCRIPT_BASE_DIR}/${svn_dep}" ]] ; then
 		echo "* Checking out ${svn_dep} . . ."
 		# NOTE: Prefer svn cat to a wget/curl GET, because it expands svn keywords.
-		svn cat https://svn.ak-team.com/svn/Configs/trunk/Kindle/Misc/${svn_dep} > ${svn_dep}
-	done
-fi
+		svn cat https://svn.ak-team.com/svn/Configs/trunk/Kindle/Misc/${svn_dep} > "${SCRIPT_BASE_DIR}/${svn_dep}"
+	fi
+done
 
 # Are we on Gentoo
 if [[ -f "/etc/gentoo-release" ]] ; then
@@ -45,7 +102,7 @@ else
 
 	# We'll need a Portage snapshot...
 	echo "* Getting a Portage snapshot . . ."
-	wget "${GENTOO_MIRROR}/snapshots/portage-latest.tar.xz" -O "${portage_wd}/portage.tar.xz"
+	do_wget "${GENTOO_MIRROR}/snapshots/portage-latest.tar.xz" "${portage_wd}/portage.tar.xz"
 
 	# Pull what we need out of the latest Portage snapshot
 	for portage_dep in $(grep '${PORTAGE_DIR}/' "${SCRIPT_NAME}" | tr ' ' '\n' | grep '${PORTAGE_DIR}') ; do
@@ -56,7 +113,7 @@ else
 		if echo "${portage_dep}" | grep -q 'distfiles' ; then
 			# Get the sources from our mirror
 			echo "* Downloading ${portage_dep##*/} . . ."
-			wget "${GENTOO_MIRROR}/distfiles/${portage_dep##*/}" -O "${portage_wd}/distfiles/${portage_dep##*/}"
+			do_wget "${GENTOO_MIRROR}/distfiles/${portage_dep##*/}" "${portage_wd}/distfiles/${portage_dep##*/}"
 		else
 			# Pull that out of the Portage snapshot
 			echo "* Pulling ${portage_dep#*/} out of the Portage tree . . ."
@@ -73,7 +130,11 @@ fi
 source ${SCRIPT_BASE_DIR}/x-compile.sh nickel env
 
 # NOTE: This is *roughly* what TC_BUILD_DIR points to in my other TCs ;).
-TC_BUILD_WD="${HOME}/Kobo/CrossTool/Build_${KINDLE_TC}"
+if [[ -n "${_XTC_WD}" ]] ; then
+	TC_BUILD_WD="${_XTC_WD}"
+else
+	TC_BUILD_WD="${HOME}/Kobo/CrossTool/Build_${KINDLE_TC}"
+fi
 
 # Override that to get rid of the counter
 update_title_info()
@@ -110,19 +171,16 @@ export CXXFLAGS="${NOLTO_CFLAGS}"
 echo "* Building zlib-ng . . ."
 echo ""
 ZLIB_SOVER="1.2.11.zlib-ng"
-rm -rf zlib-ng
-until git clone -b 1.9.9-b1 --depth 1 https://github.com/zlib-ng/zlib-ng.git ; do
-	rm -rf zlib-ng
-	sleep 15
-done
-cd zlib-ng
+do_git "https://github.com/zlib-ng/zlib-ng.git" "develop" "zlib-ng"
 update_title_info
-# NOTE: We CANNOT support runtime HWCAP checks, because we mostly don't have access to getauxval (c.f., comments around OpenSSL for more details (in x-compile.sh)).
+# NOTE: We CANNOT support runtime HWCAP checks, because we mostly don't have access to getauxval (c.f., comments around OpenSSL for more details).
 #       On the other hand, we don't need 'em: we know the exact target we're running on.
 #       So switch back to compile-time checks.
-# NOTE: Technically, with this TC, which moved to glibc 2.19, we do have access to getauxval.
-#       The point about not actually needing a runtime check still stands, though ;).
-patch -p1 <  ${SCRIPT_BASE_DIR}/zlib-ng-nerf-arm-hwcap.patch
+# NOTE: We also nerf https://github.com/zlib-ng/zlib-ng/commit/461c2796c262885593a40ae1acd2c195b300adc7,
+#       because this ensures that we can, in fact, use LTO, as everything becomes a compile-time check.
+patch -p1 < ${SCRIPT_BASE_DIR}/zlib-ng-nerf-arm-hwcap.patch
+# NOTE: This (https://github.com/zlib-ng/zlib-ng/commit/b82d3497a5afc46dec3c5d07e4b163b169f251d7) actually *broke* hardfp detection in the configure script.
+patch -p1 < ${SCRIPT_BASE_DIR}/zlib-ng-fix-arm-float-detection.diff
 env CHOST="${CROSS_TC}" ./configure --shared --prefix=${TC_BUILD_DIR} --zlib-compat --without-acle
 make ${JOBSFLAGS}
 make install
@@ -130,9 +188,9 @@ make install
 echo "* Building expat . . ."
 echo ""
 cd ..
-EXPAT_SOVER="1.6.11"
-tar -xvJf ${PORTAGE_DIR}/distfiles/expat-2.2.9.tar.xz
-cd expat-2.2.9
+EXPAT_SOVER="1.8.1"
+tar -xvJf ${PORTAGE_DIR}/distfiles/expat-2.4.1.tar.xz
+cd expat-2.4.1
 update_title_info
 ./configure --prefix=${TC_BUILD_DIR} --host=${CROSS_TC} --disable-static --enable-shared --without-docbook
 make ${JOBSFLAGS}
@@ -157,8 +215,8 @@ echo ""
 cd ..
 LIBJPG_SOVER="62.3.0"
 LIBTJP_SOVER="0.2.0"
-tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/libjpeg-turbo-2.0.4.tar.gz
-cd libjpeg-turbo-2.0.4
+tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/libjpeg-turbo-2.1.2.tar.gz
+cd libjpeg-turbo-2.1.2
 update_title_info
 # Oh, CMake (https://gitlab.kitware.com/cmake/cmake/issues/12928) ...
 export CFLAGS="${BASE_CPPFLAGS} ${NOLTO_CFLAGS}"
@@ -176,15 +234,17 @@ export CFLAGS="${NOLTO_CFLAGS}"
 #       but the version shipped by Kobo features such suffixes...
 #       Sooo, build the Kobo version, with the suffix, just to be safe...
 if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
-	echo "* Building ICU 67.1 . . ."
+	echo "* Building ICU 70.1 . . ."
 	echo ""
-	ICU_SOVER="67.1"
+	ICU_SOVER="70.1"
 	cd ..
-	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/icu4c-67_1-src.tgz
+	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/icu4c-70_1-src.tgz
 	cd icu/source
 	update_title_info
 	patch -p1 < ${PORTAGE_DIR}/dev-libs/icu/files/icu-65.1-remove-bashisms.patch
 	patch -p1 < ${PORTAGE_DIR}/dev-libs/icu/files/icu-64.2-darwin.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-libs/icu/files/icu-68.1-nonunicode.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-libs/icu/files/icu-69.1-fix-ub-units.patch
 	sed -i -e "s:LDFLAGSICUDT=-nodefaultlibs -nostdlib:LDFLAGSICUDT=:" config/mh-linux
 	sed -i -e 's:icudefs.mk:icudefs.mk Doxyfile:' configure.ac
 	autoreconf -fi
@@ -223,12 +283,8 @@ else
 	echo ""
 	ICU_SOVER="64.2"
 	cd ..
-	rm -rf icu
-	until git clone -b kobo --single-branch --depth 1 https://github.com/kobolabs/icu.git ; do
-		rm -rf icu
-		sleep 15
-	done
-	cd icu/icu4c/source
+	do_git "https://github.com/kobolabs/icu.git" "kobo" "icu"
+	cd icu4c/source
 	update_title_info
 	patch -p1 < ${PORTAGE_DIR}/dev-libs/icu/files/icu-64.2-darwin.patch
 	patch -p1 < ${PORTAGE_DIR}/dev-libs/icu/files/icu-64.1-data_archive_generation.patch
@@ -272,8 +328,8 @@ fi
 echo "* Building dbus . . ."
 echo ""
 cd ..
-tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/dbus-1.12.16.tar.gz
-cd dbus-1.12.16
+tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/dbus-1.12.20.tar.gz
+cd dbus-1.12.20
 update_title_info
 patch -p1 < ${PORTAGE_DIR}/sys-apps/dbus/files/dbus-enable-elogind.patch
 patch -p1 < ${PORTAGE_DIR}/sys-apps/dbus/files/dbus-daemon-optional.patch
@@ -286,12 +342,14 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 	echo "* Building OpenSSL 1.1.1 . . ."
 	echo ""
 	cd ..
-	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/openssl-1.1.1g.tar.gz
-	cd openssl-1.1.1g
+	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/openssl-1.1.1m.tar.gz
+	cd openssl-1.1.1m
 	update_title_info
 	export CROSS_COMPILE="${CROSS_TC}-"
 	OPENSSL_SOVER="1.1"
-	export CPPFLAGS="${BASE_CPPFLAGS} -DOPENSSL_NO_BUF_FREELISTS"
+	# NOTE: Disable https://github.com/openssl/openssl/pull/9595 as it's causing stalls long after the early boot on devices without the getrandom() syscall, which is pretty much all of them, because it's a Linux 3.17+ & glibc 2.25+ feature.
+	#       This is most easily reproduced with scp transfers that will block on the initial select on /dev/random. Since those devices are low-power, UP, and mostly idle, it can take a fairly noticeable amount of time for entropy to be generated...
+	export CPPFLAGS="${BASE_CPPFLAGS} -DOPENSSL_RAND_SEED_DEVRANDOM_SHM_ID=-1"
 	#export CFLAGS="${CPPFLAGS} ${NOLTO_CFLAGS} -fno-strict-aliasing"
 	export CFLAGS="${CPPFLAGS} ${NOLTO_CFLAGS}"
 	#export CXXFLAGS="${NOLTO_CFLAGS} -fno-strict-aliasing"
@@ -308,7 +366,7 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 	DEFAULT_CFLAGS="$(< x-compile-tmp)"
 	sed -i -e "/^CFLAGS=/s|=.*|=${DEFAULT_CFLAGS} ${CFLAGS}|" -e "/^LDFLAGS=/s|=[[:space:]]*$|=${LDFLAGS}|" Makefile
 	make -j1 AR="${CROSS_TC}-gcc-ar" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 depend
-	make AR="${CROSS_TC}-gcc-ar" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 all
+	make ${JOBSFLAGS} AR="${CROSS_TC}-gcc-ar" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 all
 	make AR="${CROSS_TC}-gcc-ar" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 install
 	export CPPFLAGS="${BASE_CPPFLAGS}"
 	export CFLAGS="${NOLTO_CFLAGS}"
@@ -319,12 +377,7 @@ else
 	echo "* Building OpenSSL 1.0.1 . . ."
 	echo ""
 	cd ..
-	rm -rf openssl
-	until git clone -b OpenSSL_1_0_1-stable --single-branch --depth 1 https://github.com/openssl/openssl.git ; do
-		rm -rf openssl
-		sleep 15
-	done
-	cd openssl
+	do_git "https://github.com/openssl/openssl.git" "OpenSSL_1_0_1-stable" "openssl"
 	update_title_info
 	export CROSS_COMPILE="${CROSS_TC}-"
 	OPENSSL_SOVER="1.0.0"
@@ -336,7 +389,7 @@ else
 	sed -i -e '/DIRS/s: fips : :g' -e '/^MANSUFFIX/s:=.*:=ssl:' -e "/^MAKEDEPPROG/s:=.*:=${CROSS_TC}-gcc:" -e '/^install:/s:install_docs::' Makefile.org
 	sed -i '/^SET_X/s:=.*:=set -x:' Makefile.shared
 	# OpenSSL 1.0.1 was dropped on 2016-02-26 in Portage... -_-"
-	wget "https://gitweb.gentoo.org/repo/gentoo.git/plain/dev-libs/openssl/files/gentoo.config-1.0.1?id=47f53172d2f6e2beaddb1c072d62e51de3884111" -O gentoo.config
+	do_wget "https://gitweb.gentoo.org/repo/gentoo.git/plain/dev-libs/openssl/files/gentoo.config-1.0.1?id=47f53172d2f6e2beaddb1c072d62e51de3884111" "gentoo.config"
 	chmod a+rx gentoo.config
 	sed -e '/^$config{dirs}/s@ "test",@@' -i Configure
 	sed -i '/stty -icanon min 0 time 50; read waste/d' config
@@ -350,7 +403,7 @@ else
 	sed -e 's/LDCMD="$${LDCMD:-$(CC)}"; LDFLAGS="$${LDFLAGS:-$(CFLAGS)}";/LDCMD="$${LDCMD:-$(CC)}"; LDFLAGS="$${LDFLAGS:-$(CFLAGS) $(LDFLAGS) $(SHARED_LDFLAGS)}";/g' -i Makefile.shared
 	sed -e 's/DO_GNU_APP=LDFLAGS="$(CFLAGS) -Wl,-rpath,$(LIBRPATH)"/DO_GNU_APP=LDFLAGS="$(CFLAGS) $(LDFLAGS) $(SHARED_LDFLAGS) -Wl,-rpath,$(LIBRPATH)"/g' -i Makefile.shared
 	make -j1 AR="${CROSS_TC}-gcc-ar r" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 depend
-	make AR="${CROSS_TC}-gcc-ar r" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 all
+	make ${JOBSFLAGS} AR="${CROSS_TC}-gcc-ar r" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 all
 	make AR="${CROSS_TC}-gcc-ar r" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 rehash
 	make AR="${CROSS_TC}-gcc-ar r" RANLIB="${CROSS_TC}-gcc-ranlib" NM="${CROSS_TC}-gcc-nm" V=1 install
 	export CPPFLAGS="${BASE_CPPFLAGS}"
@@ -364,12 +417,7 @@ fi
 echo "* Building SQLCipher . . ."
 echo ""
 cd ..
-rm -rf sqlcipher
-until git clone -b kobo --single-branch --depth 1 https://github.com/kobolabs/sqlcipher.git ; do
-	rm -rf sqlcipher
-	sleep 15
-done
-cd sqlcipher
+do_git "https://github.com/kobolabs/sqlcipher.git" "kobo" "sqlcipher"
 update_title_info
 # NOTE: The shell actually requires the COMPLETE API...
 export CPPFLAGS="${BASE_CPPFLAGS} -DSQLITE_HAS_CODEC -DSQLITE_ENABLE_FTS3_PARENTHESIS"
@@ -389,12 +437,7 @@ if [[ "${TC_WANT_QT_LTS}" == "false" ]] ; then
 	echo "* Building Qt 5.2. . ."
 	echo ""
 	cd ..
-	rm -rf qt5
-	until git clone -b v5.2.1 --single-branch --depth 1 https://github.com/qt/qt5.git ; do
-		rm -rf qt5
-		sleep 15
-	done
-	cd qt5
+	do_git "https://github.com/qt/qt5.git" "v5.2.1" "qt5"
 	update_title_info
 	./init-repository
 
@@ -417,9 +460,7 @@ if [[ "${TC_WANT_QT_LTS}" == "false" ]] ; then
 			# No qtwebdriver in 5.2
 			if [[ "${module}" != "qtwebdriver" ]] ; then
 				cd ${module}
-				git remote add kobo https://github.com/kobolabs/${module}.git
-				git fetch kobo
-				git checkout kobo
+				do_git_fetch_kobo "${module}"
 				cd -
 			fi
 		done
@@ -525,22 +566,23 @@ fi
 
 ####
 ####
-# NOTE: Everything below targets a recent Qt 5 version, which is nice, but not what we wanted :D.
+# NOTE: Everything below targets a less outdated Qt 5 version, which is nice, but not what we wanted :D.
 #       On the upside, it actually works without having to backport anything, so, that's a plus.
+# NOTE: Keep in mind that apparently, 5.12 is the ceiling when sticking to GCC 4.9. (Poor @shermp unwittingly tested that for us ^^).
+#
+# NOTE: That said, if you actually want to do something like that, I'd heartily recommend feeding BuildRoot our ct-ng TC,
+#       and letting it do the heavy lifting: that's exactly what it was built for, and it does so extremely well.
+#       In which case, you'll probably want to do that with the *Kobo* TC config (i.e., the one that doesn't rely on an hilariously old GCC).
+#       See https://github.com/Rain92/qt5-kobo-platform-plugin for a usable QPA.
 ####
 ####
 
 if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
-	# And now for an up-to-date Qt...
-	echo "* Building Qt 5.14. . ."
+	# And now for a slightly less outdated Qt...
+	echo "* Building Qt 5.12. . ."
 	echo ""
 	cd ..
-	rm -rf qt5
-	until git clone -b 5.14 --single-branch --depth 1 https://github.com/qt/qt5.git ; do
-		rm -rf qt5
-		sleep 15
-	done
-	cd qt5
+	do_git "https://github.com/qt/qt5.git" "5.12" "qt5"
 	update_title_info
 	./init-repository
 
@@ -604,14 +646,21 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 
 	echo "* Building libxml2 . . ."
 	echo ""
-	LIBXML2_VERSION="2.9.9"
+	LIBXML2_VERSION="2.9.12"
 	cd ..
-	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/libxml2-2.9.9.tar.gz
+	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/libxml2-${LIBXML2_VERSION}.tar.gz
 	cd libxml2-${LIBXML2_VERSION}
 	update_title_info
-	tar -xvJf ${PORTAGE_DIR}/distfiles/libxml2-2.9.9-patchset.tar.xz
 	# Gentoo Patches...
+	tar xvf ${PORTAGE_DIR}/distfiles/libxml2-${LIBXML2_VERSION}-r5-patchset.tar.bz2
 	for patchfile in patches/* ; do
+		if [[ ! -f "${patchfile}" ]] ; then
+			continue
+		fi
+		# Skip the funky dummy tarball
+		if [[ "${patchfile}" == *.tar ]] ; then
+			continue
+		fi
 		# Try to detect if we need p0 or p1...
 		if grep -q 'diff --git' "${patchfile}" ; then
 			echo "Applying ${patchfile} w/ p1 . . ."
@@ -621,10 +670,15 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 			patch -p0 < ${patchfile}
 		fi
 	done
-	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxml2/files/libxml2-2.7.1-catalog_path.patch
-	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxml2/files/libxml2-2.9.2-python-ABIFLAG.patch
-	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxml2/files/libxml2-2.9.8-out-of-tree-test.patch
-	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxml2/files/2.9.9-python3-unicode-errors.patch
+	patch -p1 < ./libxml2-2.7.1-catalog_path.patch
+	patch -p1 < ./libxml2-2.9.2-python-ABIFLAG.patch
+	patch -p1 < ./libxml2-2.9.8-out-of-tree-test.patch
+	patch -p1 < ./libxml2-2.9.8-python3-unicode-errors.patch
+	patch -p1 < ./libxml2-2.9.11-disable-fuzz-tests.patch
+	patch -p1 < ./libxml2-2.9.12-respect-LDFLAGS-as-needed.patch
+	patch -p1 < ./libxml2-2.9.12-dont-copy-python-ldflags.patch
+	patch -p1 < ./libxml2-2.9.12-fix-lxml-compatibility.patch
+	patch -p1 < ./libxml2-2.9.12-Fix-whitespace-when-serializing-empty-HTML-documents.patch
 	autoreconf -fi
 	./configure --prefix=${TC_BUILD_DIR} --host=${CROSS_TC} --disable-static --enable-shared --without-run-debug --without-mem-debug --without-lzma --disable-ipv6 --without-readline --without-history --without-python --with-icu
 	make ${JOBSFLAGS} V=1
@@ -632,16 +686,14 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 
 	echo "* Building libxslt . . ."
 	echo ""
-	LIBXSLT_VERSION="1.1.33"
+	LIBXSLT_VERSION="1.1.34"
 	LIBEXSLT_SOVER="0.8.20"
 	cd ..
-	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/libxslt-1.1.33.tar.gz
+	tar -I pigz -xvf ${PORTAGE_DIR}/distfiles/libxslt-${LIBXSLT_VERSION}.tar.gz
 	cd libxslt-${LIBXSLT_VERSION}
 	update_title_info
-	# Gentoo Patches...
-	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxslt/files/1.1.32-simplify-python.patch
-	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxslt/files/libxslt-1.1.28-disable-static-modules.patch
-	patch -p1 < ${PORTAGE_DIR}/distfiles/libxslt-1.1.33-CVE-2019-11068.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxslt/files/libxslt-1.1.34-libxml2-2.9.12.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-libs/libxslt/files/libxslt-1.1.34-CVE-2021-30560.patch
 	autoreconf -fi
 	env ac_cv_path_ac_pt_XML_CONFIG=${TC_BUILD_DIR}/bin/xml2-config PKG_CONFIG="pkg-config --static" ./configure --prefix=${TC_BUILD_DIR} --host=${CROSS_TC} --disable-static --enable-shared --without-crypto --without-debug --without-mem-debug --without-python
 	make ${JOBSFLAGS} V=1
@@ -650,12 +702,20 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 	echo "* Building SQLite3 . . ."
 	echo ""
 	SQLITE_SOVER="0.8.6"
-	SQLITE_VER="3310100"
+	SQLITE_VER="3320300"
 	cd ..
-	wget https://sqlite.org/2020/sqlite-src-${SQLITE_VER}.zip -O sqlite-src-${SQLITE_VER}.zip
+	do_wget "https://sqlite.org/2020/sqlite-src-${SQLITE_VER}.zip" "sqlite-src-${SQLITE_VER}.zip"
 	unzip sqlite-src-${SQLITE_VER}.zip
 	cd sqlite-src-${SQLITE_VER}
 	update_title_info
+	# Gentoo patches
+	# NOTE: We skip the "full_archive-build" ones, as I'm not quite sure we really want them, and, given the way we build SQLite,
+	#       they tend to be more trouble thna they're worth (as in, everything implodes with unresolved symbols :D).
+	#patch -p1 < ${PORTAGE_DIR}/dev-db/sqlite/files/sqlite-3.32.1-full_archive-build_1.patch
+	#patch -p1 < ${PORTAGE_DIR}/dev-db/sqlite/files/sqlite-3.32.1-full_archive-build_2.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-db/sqlite/files/sqlite-3.32.3-backports_1.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-db/sqlite/files/sqlite-3.32.3-backports_2.patch
+	patch -p1 < ${PORTAGE_DIR}/dev-db/sqlite/files/sqlite-3.32.3-backports_3.patch
 	# LTO makefile compat...
 	patch -p1 < ${SCRIPT_BASE_DIR}/sqlite-fix-Makefile-for-lto.patch
 	autoreconf -fi
@@ -683,18 +743,13 @@ if [[ "${TC_WANT_QT_LTS}" == "true" ]] ; then
 	echo "* Building QtWebKit. . ."
 	echo ""
 	cd ..
-	rm -rf qtwebkit
 	# We're also going to need a bucketload of free space...
 	rm -rf dbus-* expat-* icu icu-host libjpeg-turbo-* libpng-* libxml2-* libxslt-* openssl-* sqlite-src-* qt5 zlib-ng
 	# NOTE: LTO is iffy w/ GCC 4.9, let's kill it, see if that fixes a few undef ref errors
 	#       To no-one's surprise, it does. Oh, how I haven't missed you, GCC 4.9...
 	export CFLAGS="${NOLTO_CFLAGS}"
 	export CXXFLAGS="${NOLTO_CFLAGS}"
-	until git clone -b 5.212 --single-branch --depth 1 https://github.com/qt/qtwebkit.git ; do
-		rm -rf qtwebkit
-		sleep 15
-	done
-	cd qtwebkit
+	do_git "https://github.com/qt/qtwebkit.git" "5.212" "qtwebkit"
 	update_title_info
 	mkdir build
 	cd build
@@ -710,3 +765,6 @@ fi
 if [[ ! -f "/etc/gentoo-release" ]] ; then
 	rm -rf "${PORTAGE_DIR}"
 fi
+
+# Exterminate Qt's la files with extreme prejudice
+prune_la_files
