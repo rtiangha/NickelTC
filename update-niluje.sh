@@ -6,7 +6,7 @@ rm -rf niluje
 mkdir niluje
 cd niluje
 
-rev=18954
+rev=19380
 files=(
     CMakeCross.txt
     kobo-nickel-sysroot.sh
